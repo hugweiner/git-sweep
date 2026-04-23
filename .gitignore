@@ -1,0 +1,22 @@
+# Python
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+.venv/
+env/
+.cache/
+*.egg-info/
+*.log
+.eggs/
+htmlcov/
+.tox/
+*.egg
+.Python
+Thumbs.db
+build/
+.DS_Store
+.mypy_cache/
+.pytest_cache/
