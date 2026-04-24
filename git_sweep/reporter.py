@@ -1,54 +1,62 @@
-"""Reporting and formatting utilities for git-sweep output."""
+"""Reporter: format branch tables and cleanup results for terminal output."""
+
+from __future__ import annotations
 
 from typing import List
 
 from git_sweep.cleaner import CleanupResult
-from git_sweep.detector import BranchInfo
+from git_sweep.snapshot import Snapshot
+
+_COL_NAME = 40
+_COL_DATE = 20
+_COL_FLAG = 10
 
 
-def format_branch_table(branches: List[BranchInfo]) -> str:
-    """Format detected branches as a human-readable table."""
+def format_branch_table(branches) -> str:  # branches: List[BranchInfo]
     if not branches:
-        return "No branches to clean up."
-
-    header = f"{'Branch':<40} {'Merged':<8} {'Stale':<8} {'Last Commit'}"
-    separator = "-" * 75
-    lines = [header, separator]
-
+        return "No branches found."
+    header = (
+        f"{'BRANCH':<{_COL_NAME}} {'LAST COMMIT':<{_COL_DATE}}"
+        f" {'MERGED':<{_COL_FLAG}} {'STALE':<{_COL_FLAG}}"
+    )
+    sep = "-" * len(header)
+    rows = [header, sep]
     for b in branches:
-        last_commit = b.last_commit_date.strftime("%Y-%m-%d") if b.last_commit_date else "unknown"
-        lines.append(f"{b.name:<40} {'yes' if b.is_merged else 'no':<8} {'yes' if b.is_stale else 'no':<8} {last_commit}")
-
-    return "\n".join(lines)
+        date_str = b.last_commit.strftime("%Y-%m-%d") if b.last_commit else "unknown"
+        rows.append(
+            f"{b.name:<{_COL_NAME}} {date_str:<{_COL_DATE}}"
+            f" {'yes' if b.is_merged else 'no':<{_COL_FLAG}}"
+            f" {'yes' if b.is_stale else 'no':<{_COL_FLAG}}"
+        )
+    return "\n".join(rows)
 
 
 def format_cleanup_results(results: List[CleanupResult]) -> str:
-    """Format cleanup results as a summary report."""
     if not results:
-        return "Nothing was cleaned up."
-
-    success_count = sum(1 for r in results if r.success and not r.dry_run)
-    dry_run_count = sum(1 for r in results if r.dry_run)
-    failure_count = sum(1 for r in results if not r.success)
-
+        return "Nothing to clean up."
     lines = []
-    for result in results:
-        scope = f"{result.remote}/{result.branch}" if result.remote else result.branch
-        if result.dry_run:
-            lines.append(f"  [dry-run] would delete: {scope}")
-        elif result.success:
-            lines.append(f"  [deleted] {scope}")
-        else:
-            lines.append(f"  [failed]  {scope} — {result.error}")
+    for r in results:
+        status = "OK" if r.success else "FAILED"
+        dry = " [dry-run]" if r.dry_run else ""
+        msg = f" ({r.message})" if r.message else ""
+        lines.append(f"  [{status}]{dry} {r.branch}{msg}")
+    ok = sum(1 for r in results if r.success)
+    lines.append(f"\n{ok}/{len(results)} branches cleaned up.")
+    return "\n".join(lines)
 
-    summary_parts = []
-    if dry_run_count:
-        summary_parts.append(f"{dry_run_count} would be deleted (dry run)")
-    if success_count:
-        summary_parts.append(f"{success_count} deleted")
-    if failure_count:
-        summary_parts.append(f"{failure_count} failed")
 
-    lines.append("")
-    lines.append("Summary: " + ", ".join(summary_parts))
+def format_snapshot_diff(old: Snapshot, new: Snapshot) -> str:
+    """Summarise what changed between two snapshots."""
+    diff = new.diff(old)
+    lines = [f"Snapshot diff ({old.captured_at} -> {new.captured_at})"]
+    if diff["added"]:
+        lines.append("  New branches detected:")
+        for name in diff["added"]:
+            lines.append(f"    + {name}")
+    if diff["removed"]:
+        lines.append("  Branches no longer present:")
+        for name in diff["removed"]:
+            lines.append(f"    - {name}")
+    if not diff["added"] and not diff["removed"]:
+        lines.append("  No changes detected.")
     return "\n".join(lines)

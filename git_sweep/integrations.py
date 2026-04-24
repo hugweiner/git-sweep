@@ -1,74 +1,101 @@
-"""High-level integration: wire scheduler + hooks + sweep into one callable."""
+"""Integrations: tie together sweep pipeline with scheduling, hooks, and snapshots."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Callable, List, Optional
+from dataclasses import dataclass
+from typing import Optional
 
-from git_sweep.scheduler import ScheduleEntry, load_schedule, save_schedule, maybe_run_sweep
-from git_sweep.hooks import HookConfig, HookResult, run_hooks_around
+from git_sweep.config import SweepConfig, load_config
+from git_sweep.detector import detect_branches
+from git_sweep.cleaner import cleanup_branches
+from git_sweep.hooks import run_pre_sweep, run_post_sweep
+from git_sweep.scheduler import is_due, mark_ran, load_schedule, save_schedule
+from git_sweep.snapshot import capture_snapshot, load_snapshot, save_snapshot
+from git_sweep.reporter import format_snapshot_diff
 
 
 @dataclass
 class IntegrationResult:
-    scheduled: bool
-    pre_hook: Optional[HookResult]
-    sweep_output: object
-    post_hook: Optional[HookResult]
-    aborted: bool = False
+    ran: bool
+    skipped_reason: Optional[str]
+    branches_cleaned: int
+    snapshot_diff: Optional[str]
+    error: Optional[str]
 
-    @property
-    def success(self) -> bool:
-        if self.aborted:
-            return False
-        if self.pre_hook is not None and not self.pre_hook.success:
-            return False
-        if self.post_hook is not None and not self.post_hook.success:
-            return False
-        return True
+
+def success(cleaned: int, diff: Optional[str] = None) -> IntegrationResult:
+    return IntegrationResult(
+        ran=True,
+        skipped_reason=None,
+        branches_cleaned=cleaned,
+        snapshot_diff=diff,
+        error=None,
+    )
 
 
 def run_scheduled_sweep(
-    sweep_fn: Callable[[List[str]], object],
-    schedule_path: Path = Path(".git-sweep-schedule.json"),
-    hook_cfg: Optional[HookConfig] = None,
-    abort_on_pre_failure: bool = True,
-    now: Optional[datetime] = None,
-) -> Optional[IntegrationResult]:
-    """Check the schedule; if due, run hooks + sweep and persist the updated schedule.
+    config_path: Optional[str] = None,
+    schedule_path: Optional[str] = None,
+    snapshot_path: Optional[str] = None,
+) -> IntegrationResult:
+    cfg = load_config(config_path) if config_path else load_config()
+    schedule = load_schedule(schedule_path) if schedule_path else load_schedule()
 
-    Returns an IntegrationResult when the sweep ran, or None if it was skipped.
-    """
-    now = now or datetime.now(timezone.utc)
-    entry = load_schedule(path=schedule_path)
+    if not is_due(schedule):
+        return IntegrationResult(
+            ran=False,
+            skipped_reason="not due",
+            branches_cleaned=0,
+            snapshot_diff=None,
+            error=None,
+        )
 
-    if not entry.is_due(now=now):
-        return None
+    result = _sweep(cfg, snapshot_path=snapshot_path)
 
-    hook_cfg = hook_cfg or HookConfig()
-    result_holder: list = []
+    if result.ran:
+        mark_ran(schedule)
+        if schedule_path:
+            save_schedule(schedule, schedule_path)
+        else:
+            save_schedule(schedule)
 
-    def _sweep():
-        output = sweep_fn(entry.extra_args)
-        result_holder.append(output)
-        return output
+    return result
 
-    pre, sweep_out, post = run_hooks_around(
-        hook_cfg, _sweep, abort_on_pre_failure=abort_on_pre_failure
-    )
 
-    aborted = sweep_out is None and abort_on_pre_failure and pre is not None and not pre.success
+def _sweep(
+    cfg: SweepConfig,
+    snapshot_path: Optional[str] = None,
+) -> IntegrationResult:
+    pre = run_pre_sweep(cfg)
+    if pre is not None and not pre.success:
+        return IntegrationResult(
+            ran=False,
+            skipped_reason="pre-sweep hook failed",
+            branches_cleaned=0,
+            snapshot_diff=None,
+            error=pre.output,
+        )
 
-    if not aborted:
-        entry.mark_ran(now=now)
-        save_schedule(entry, path=schedule_path)
+    try:
+        branches = detect_branches(cfg)
+    except Exception as exc:  # noqa: BLE001
+        return IntegrationResult(ran=False, skipped_reason=None, branches_cleaned=0, snapshot_diff=None, error=str(exc))
 
-    return IntegrationResult(
-        scheduled=True,
-        pre_hook=pre,
-        sweep_output=sweep_out,
-        post_hook=post,
-        aborted=aborted,
-    )
+    old_snap = load_snapshot(snapshot_path) if snapshot_path else load_snapshot()
+    new_snap = capture_snapshot(branches, base_branch=cfg.base_branch)
+
+    diff_str: Optional[str] = None
+    if old_snap is not None:
+        diff_str = format_snapshot_diff(old_snap, new_snap)
+
+    if snapshot_path:
+        save_snapshot(new_snap, snapshot_path)
+    else:
+        save_snapshot(new_snap)
+
+    results = cleanup_branches(branches, cfg)
+    cleaned = sum(1 for r in results if r.success and not r.dry_run)
+
+    run_post_sweep(cfg)
+
+    return success(cleaned, diff_str)
